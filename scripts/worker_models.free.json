@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "policy": {
+    "allow_paid": false,
+    "require_zero_pricing_before_run": true,
+    "provider": "nous",
+    "notes": "Only models with prompt=0 and completion=0 from Nous /v1/models are allowed. If pricing changes or auth fails, worker_router.py blocks execution. Gemini Flash is intentionally not included because it is not free here."
+  },
+  "workers": {
+    "qwen": {
+      "name": "Qwen 3.6 Plus Worker",
+      "model": "qwen/qwen3.6-plus",
+      "best_for": ["coding", "debugging", "reasoning", "strategy analysis", "repo edits"],
+      "default_toolsets": "terminal,file",
+      "max_prompt_chars": 24000
+    },
+    "stepfun": {
+      "name": "StepFun 3.5 Flash Worker",
+      "model": "stepfun/step-3.5-flash",
+      "best_for": ["fast summaries", "classification", "cleaning text", "short research"],
+      "default_toolsets": "",
+      "max_prompt_chars": 16000
+    },
+    "owl": {
+      "name": "Owl Alpha Long-Context Worker",
+      "model": "openrouter/owl-alpha",
+      "best_for": ["long context reading", "large notes", "large logs", "broad synthesis"],
+      "default_toolsets": "",
+      "max_prompt_chars": 32000
+    }
+  },
+  "routes": {
+    "code": "qwen",
+    "debug": "qwen",
+    "reason": "qwen",
+    "trading": "qwen",
+    "summary": "stepfun",
+    "summarize": "stepfun",
+    "classify": "stepfun",
+    "fast": "stepfun",
+    "long": "owl",
+    "context": "owl",
+    "logs": "owl"
+  }
+}
