@@ -10,10 +10,11 @@ the argparse subparsers on demand.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 
 def _fmt_ts(ts: Optional[str]) -> str:
@@ -36,16 +37,113 @@ def _fmt_ts(ts: Optional[str]) -> str:
     return f"{secs // 86400}d ago"
 
 
-def _cmd_status(args) -> int:
+
+def _status_payload() -> Dict[str, Any]:
+    """Return the machine-readable status model used by text and JSON output."""
     from agent import curator
     from tools import skill_usage
 
     state = curator.load_state()
     enabled = curator.is_enabled()
-    paused = state.get("paused", False)
-    last_run = state.get("last_run_at")
-    summary = state.get("last_run_summary") or "(none)"
-    runs = state.get("run_count", 0)
+    paused = bool(state.get("paused", False))
+    rows = skill_usage.agent_created_report()
+
+    by_state: Dict[str, int] = {}
+    pinned: List[str] = []
+    for r in rows:
+        state_name = r.get("state", "active")
+        by_state[state_name] = by_state.get(state_name, 0) + 1
+        if r.get("pinned"):
+            pinned.append(r["name"])
+
+    report_path = state.get("last_report_path")
+    return {
+        "enabled": enabled,
+        "paused": paused,
+        "status": "enabled" if enabled and not paused else "paused" if paused else "disabled",
+        "runs": int(state.get("run_count", 0) or 0),
+        "last_run_at": state.get("last_run_at"),
+        "last_run_summary": state.get("last_run_summary") or "(none)",
+        "last_report_path": report_path,
+        "last_report_exists": bool(report_path and Path(report_path).exists()),
+        "interval_hours": curator.get_interval_hours(),
+        "stale_after_days": curator.get_stale_after_days(),
+        "archive_after_days": curator.get_archive_after_days(),
+        "skill_count": len(rows),
+        "by_state": by_state,
+        "pinned": sorted(pinned),
+        "skills": rows,
+    }
+
+
+def _load_run_reports(limit: int = 10) -> List[Dict[str, Any]]:
+    """Load newest curator run.json files from ~/.hermes/logs/curator/."""
+    from agent import curator
+
+    root = curator._reports_root()
+    if limit < 1:
+        limit = 1
+    reports: List[Dict[str, Any]] = []
+    for run_json in sorted(root.glob("*/run.json"), reverse=True)[:limit]:
+        try:
+            payload = json.loads(run_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload.setdefault("run_dir", str(run_json.parent))
+        reports.append(payload)
+    return reports
+
+
+def _report_payload(limit: int = 10) -> Dict[str, Any]:
+    runs = _load_run_reports(limit=limit)
+    totals = {
+        "runs": len(runs),
+        "archived": 0,
+        "consolidated": 0,
+        "pruned": 0,
+        "added": 0,
+        "state_transitions": 0,
+        "restored_or_reactivated": 0,
+        "llm_errors": 0,
+        "cron_jobs_rewritten": 0,
+        "tool_calls_total": 0,
+    }
+    for r in runs:
+        counts = r.get("counts") or {}
+        auto = r.get("auto_transitions") or {}
+        totals["archived"] += int(counts.get("archived_this_run", 0) or 0)
+        totals["consolidated"] += int(counts.get("consolidated_this_run", 0) or 0)
+        totals["pruned"] += int(counts.get("pruned_this_run", 0) or 0)
+        totals["added"] += int(counts.get("added_this_run", 0) or 0)
+        totals["state_transitions"] += int(counts.get("state_transitions", 0) or 0)
+        totals["cron_jobs_rewritten"] += int(counts.get("cron_jobs_rewritten", 0) or 0)
+        totals["tool_calls_total"] += int(counts.get("tool_calls_total", 0) or 0)
+        totals["restored_or_reactivated"] += int(auto.get("reactivated", 0) or 0)
+        if r.get("llm_error"):
+            totals["llm_errors"] += 1
+        for t in r.get("state_transitions") or []:
+            if isinstance(t, dict) and t.get("from") == "archived" and t.get("to") == "active":
+                totals["restored_or_reactivated"] += 1
+    return {"limit": limit, "totals": totals, "runs": runs}
+
+
+def _cmd_status(args) -> int:
+    payload = _status_payload()
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    from agent import curator
+    from tools import skill_usage
+
+    state = curator.load_state()
+    enabled = payload["enabled"]
+    paused = payload["paused"]
+    last_run = payload["last_run_at"]
+    summary = payload["last_run_summary"]
+    runs = payload["runs"]
 
     status_line = (
         "ENABLED" if enabled and not paused else
@@ -164,6 +262,37 @@ def _cmd_status(args) -> int:
 
     return 0
 
+
+
+def _cmd_report(args) -> int:
+    limit = int(getattr(args, "limit", 10) or 10)
+    payload = _report_payload(limit=limit)
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    totals = payload["totals"]
+    print(f"curator report: {totals['runs']} recent run(s) (limit {payload['limit']})")
+    print(f"  archived:       {totals['archived']}")
+    print(f"  consolidated:   {totals['consolidated']}")
+    print(f"  pruned:         {totals['pruned']}")
+    print(f"  added:          {totals['added']}")
+    print(f"  restored/reactivated: {totals['restored_or_reactivated']}")
+    print(f"  llm errors:     {totals['llm_errors']}")
+    print(f"  cron rewrites:  {totals['cron_jobs_rewritten']}")
+    print(f"  tool calls:     {totals['tool_calls_total']}")
+    if payload["runs"]:
+        print("\nrecent runs:")
+        for r in payload["runs"]:
+            counts = r.get("counts") or {}
+            print(
+                f"  {r.get('started_at', '?')}  "
+                f"archived={counts.get('archived_this_run', 0)}  "
+                f"consolidated={counts.get('consolidated_this_run', 0)}  "
+                f"pruned={counts.get('pruned_this_run', 0)}  "
+                f"dir={r.get('run_dir', '')}"
+            )
+    return 0
 
 def _cmd_run(args) -> int:
     from agent import curator
@@ -487,7 +616,13 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     subs = parent.add_subparsers(dest="curator_command")
 
     p_status = subs.add_parser("status", help="Show curator status and skill stats")
+    p_status.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     p_status.set_defaults(func=_cmd_status)
+
+    p_report = subs.add_parser("report", help="Summarize recent curator run reports")
+    p_report.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    p_report.add_argument("--limit", type=int, default=10, help="Number of recent run.json files to aggregate")
+    p_report.set_defaults(func=_cmd_report)
 
     p_run = subs.add_parser("run", help="Trigger a curator review now")
     p_run.add_argument(
