@@ -144,6 +144,15 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    # ── Defense-in-depth: headroom compression (Layer 1.5) ──────────
+    # Try compressing first.  If it shrinks the result enough we save
+    # both context tokens AND disk I/O.  Graceful no-op on any failure
+    # (config off, adapter missing, Mac Studio unreachable, content
+    # not JSON-shaped, etc.).  Idempotent: the upstream hook in
+    # agent_runtime_helpers.invoke_tool may have already compressed.
+    from tools.headroom_compression import maybe_compress_tool_output
+    content = maybe_compress_tool_output(content)
+
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):

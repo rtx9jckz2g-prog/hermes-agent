@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -1784,8 +1785,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     tool_start_time = time.monotonic()
 
+    # ── Headroom tool output compression (opt-in) ─────────────────────
+    # When enabled in config.yaml (tool_compression.headroom.enabled: true),
+    # large JSON tool results are sent through Headroom on Mac Studio for
+    # 50-70% token savings before they enter the LLM context. Verified
+    # deterministic (same input → same output) so prompt caching stays intact.
+    # Graceful no-op on any failure.
+    # Implementation lives in tools.headroom_compression; import lazily so
+    # the new module can be patched/tested without touching this file.
+    def _maybe_compress_tool_output(result: Any) -> Any:
+        from tools.headroom_compression import maybe_compress_tool_output
+        return maybe_compress_tool_output(result)
+
     def _finish_agent_tool(result: Any, observed_args: Optional[dict] = None) -> Any:
         hook_args = observed_args if isinstance(observed_args, dict) else function_args
+        # Headroom compression (opt-in via config) — deterministic so prompt cache stays valid
+        result = _maybe_compress_tool_output(result)
         try:
             from model_tools import _emit_post_tool_call_hook
             _emit_post_tool_call_hook(
@@ -1906,7 +1921,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
         def _execute(next_args: dict) -> Any:
-            return _ra().handle_function_call(
+            # General tool path: invoke via _ra().handle_function_call and
+            # run the result through headroom compression (opt-in via
+            # config.tool_compression.headroom).  See _finish_agent_tool
+            # above for the equivalent hook on the special-tool path.
+            result = _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
@@ -1919,6 +1938,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+            return _maybe_compress_tool_output(result)
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
